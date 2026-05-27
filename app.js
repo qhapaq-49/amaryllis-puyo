@@ -11,6 +11,213 @@ let state = {
   p2: emptyPlayer(),
 };
 
+let evalWorker = null;
+let evalWorkerReady = false;
+let evalWorkerReadyPromise = null;
+let evalCallId = 0;
+const evalPending = new Map();
+
+function initEvalWorker() {
+  if (evalWorkerReadyPromise) return evalWorkerReadyPromise;
+  evalWorkerReadyPromise = new Promise((resolve, reject) => {
+    evalWorker = new Worker('eval-worker.js');
+    evalWorker.onmessage = e => {
+      if (e.data.type === 'ready') {
+        evalWorkerReady = true;
+        resolve();
+        return;
+      }
+      if (e.data.type === 'init_error') {
+        reject(new Error(e.data.message || 'WASM初期化に失敗しました'));
+        return;
+      }
+      const callbacks = evalPending.get(e.data.id);
+      if (!callbacks) return;
+      evalPending.delete(e.data.id);
+      if (e.data.error) callbacks.reject(new Error(e.data.error));
+      else {
+        try {
+          callbacks.resolve(JSON.parse(e.data.result));
+        } catch (err) {
+          callbacks.reject(err);
+        }
+      }
+    };
+    evalWorker.onerror = e => reject(new Error(e.message || 'WASM worker error'));
+  });
+  return evalWorkerReadyPromise;
+}
+
+async function queryEvalWasm(payload) {
+  if (!evalWorkerReady) {
+    setStatus('ama初期化中...');
+    await initEvalWorker();
+  }
+  return new Promise((resolve, reject) => {
+    const id = evalCallId++;
+    evalPending.set(id, { resolve, reject });
+    evalWorker.postMessage({ id, input: JSON.stringify(payload) });
+  });
+}
+
+function activeColors(player) {
+  const colors = [];
+  function add(c) {
+    if (['R', 'Y', 'G', 'B', 'P'].includes(c) && !colors.includes(c)) colors.push(c);
+  }
+  for (const row of player.field || []) {
+    for (const c of String(row)) add(c);
+  }
+  const pairs = [];
+  if (player.current_piece) pairs.push(player.current_piece);
+  pairs.push(...(player.queue || []));
+  for (const pair of pairs) {
+    if (!Array.isArray(pair)) continue;
+    add(pair[0]);
+    add(pair[1]);
+  }
+  return colors;
+}
+
+function normalizePlayerForAma(player) {
+  const amaColors = ['R', 'Y', 'G', 'B'];
+  const colors = activeColors(player);
+  if (colors.length > 4) throw new Error(`ama supports up to 4 colors: ${colors.join('')}`);
+  const mapping = { '.': '.', '#': '#' };
+  colors.forEach((c, i) => { mapping[c] = amaColors[i]; });
+
+  const field = (player.field || []).map(row => String(row).slice(0, 6).padEnd(6, '.').split('').map(c => mapping[c] || '.').join(''));
+  if (field.length !== 13) throw new Error('field must contain exactly 13 rows');
+
+  const queue = [];
+  const pairs = [];
+  if (player.current_piece) pairs.push(player.current_piece);
+  pairs.push(...(player.queue || []));
+  for (const pair of pairs) {
+    if (!Array.isArray(pair) || pair.length !== 2) continue;
+    const a = mapping[pair[0]];
+    const b = mapping[pair[1]];
+    if (a && b && a !== '.' && b !== '.' && a !== '#' && b !== '#') queue.push([a, b]);
+  }
+  if (queue.length < 3) throw new Error('current piece plus NEXT1 and NEXT2 are required');
+  return { field, queue, garbage: Math.max(0, Number(player.garbage) || 0) };
+}
+
+function actionSend(action) {
+  const attack = action?.attack || {};
+  return Number(attack.send_total ?? attack.send ?? 0) || 0;
+}
+
+function summarySend(summary) {
+  if (!summary) return 0;
+  return actionSend(summary.best);
+}
+
+function buildScore(side) {
+  const build = side?.strategy?.build_quality || {};
+  const beam = build.beam_build?.best?.ama_eval;
+  if (beam !== undefined && beam !== null) return Number(beam) || 0;
+  return Number(build.fast_build?.best?.value || 0);
+}
+
+function sideBattleMetrics(side) {
+  const strategy = side?.strategy || {};
+  const incoming = strategy.incoming || {};
+  const offense = strategy.offense || {};
+  const pending = side?.pending || {};
+  const responseCandidates = [
+    summarySend(incoming.all_clear_return),
+    summarySend(incoming.immediate_main_return?.candidates),
+    summarySend(incoming.syncro_return),
+    summarySend(incoming.small_return),
+    summarySend(incoming.main_return),
+    summarySend(incoming.desperate_return),
+    Number(offense.attack_max_send_total || 0),
+  ];
+  for (const action of side?.self_attack_candidates || []) responseCandidates.push(actionSend(action));
+  const incomingCount = Number(pending.incoming || 0);
+  const acceptLimit = Number(incoming.accept_limit ?? side?.defense?.accept_limit ?? 0);
+  const responseSend = Math.max(0, ...responseCandidates.map(v => Number(v) || 0));
+  const survivalMargin = acceptLimit + responseSend - incomingCount;
+  let status = 'stable';
+  if (incomingCount > 0 && survivalMargin < 0) status = 'critical';
+  else if (incomingCount > acceptLimit) status = 'counter_required';
+  else if (incomingCount > 0) status = 'can_accept';
+  return {
+    incoming: incomingCount,
+    accept_limit: acceptLimit,
+    max_response_send: responseSend,
+    survival_margin: survivalMargin,
+    attack_max_send: Number(offense.attack_max_send_total || 0),
+    build_score: buildScore(side),
+    status,
+  };
+}
+
+function estimateBattle(strategy) {
+  if (!strategy?.p1 || !strategy?.p2) return null;
+  const metrics = { p1: sideBattleMetrics(strategy.p1), p2: sideBattleMetrics(strategy.p2) };
+  const p1 = metrics.p1;
+  const p2 = metrics.p2;
+  const p1Dead = p1.status === 'critical';
+  const p2Dead = p2.status === 'critical';
+  const marginDiff = p1.survival_margin - p2.survival_margin;
+  const attackDiff = p1.attack_max_send - p2.attack_max_send;
+  const buildDiff = p1.build_score - p2.build_score;
+  let leader;
+  let score;
+  let reason;
+  if (p1Dead && !p2Dead) {
+    leader = 'p2';
+    score = -100000 + marginDiff * 100;
+    reason = `P1は受け+最大返しが頭上おじゃまに${Math.abs(p1.survival_margin)}個不足`;
+  } else if (p2Dead && !p1Dead) {
+    leader = 'p1';
+    score = 100000 + marginDiff * 100;
+    reason = `P2は受け+最大返しが頭上おじゃまに${Math.abs(p2.survival_margin)}個不足`;
+  } else if (p1Dead && p2Dead) {
+    score = marginDiff * 100 + attackDiff * 10;
+    leader = score > 0 ? 'p1' : score < 0 ? 'p2' : 'even';
+    reason = '双方が致死級のおじゃまを抱えているため、生存余力の差を優先';
+  } else {
+    score = marginDiff * 100 + attackDiff * 10 + buildDiff / 100;
+    leader = score > 250 ? 'p1' : score < -250 ? 'p2' : 'even';
+    reason = `生存余力差 ${marginDiff}個、最大火力差 ${attackDiff}個、積み評価差 ${buildDiff}`;
+  }
+  const confidence = Math.abs(score) >= 5000 || p1Dead !== p2Dead ? 'high' : Math.abs(score) >= 1000 ? 'medium' : 'low';
+  return { leader, score: Math.trunc(score), confidence, players: metrics, reason };
+}
+
+function beamCandidates(side) {
+  const top = side?.strategy?.build_quality?.beam_build?.top || [];
+  return {
+    candidates: top.map(c => ({
+      x: c.placement?.x ?? 0,
+      r: c.placement?.r ?? 'UP',
+      score: c.score ?? 0,
+      expected_score: c.ama_eval ?? c.score ?? 0,
+    })),
+    elapsed_ms: side?.elapsed_ms,
+  };
+}
+
+function prepareEvalResponse(raw) {
+  if (raw.error) return raw;
+  const strategy = { p1: raw.p1, p2: raw.p2 };
+  const battleEval = estimateBattle(strategy);
+  if (battleEval) {
+    if (strategy.p1) strategy.p1.battle = battleEval.players.p1;
+    if (strategy.p2) strategy.p2.battle = battleEval.players.p2;
+  }
+  return {
+    players: { p1: beamCandidates(raw.p1), p2: beamCandidates(raw.p2) },
+    strategy,
+    battle_eval: battleEval,
+    eval: null,
+    meta: raw.meta,
+  };
+}
+
 function emptyPlayer() {
   return {
     field: Array.from({ length: 13 }, () => '......'),
@@ -145,18 +352,13 @@ function renderAll() {
 
 async function analyzeImage() {
   if (!selectedFile) return;
+  if (typeof window.analyzeScreenFile !== 'function') {
+    setStatus('画像解析モジュールが読み込まれていません', true);
+    return;
+  }
   setStatus('解析中...');
-  const imageBase64 = await readFileAsDataURL(selectedFile);
-  const res = await fetch('/api/analyze', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      filename: selectedFile.name,
-      image_base64: imageBase64,
-    }),
-  });
-  const data = await res.json();
-  if (!res.ok || data.error) {
+  const data = await window.analyzeScreenFile(selectedFile);
+  if (data.error) {
     setStatus(data.error || '解析に失敗しました', true);
     return;
   }
@@ -165,15 +367,6 @@ async function analyzeImage() {
   renderAll();
   renderMessages(JSON.stringify(data, null, 2));
   setStatus('解析完了。必要なら盤面・ツモ・頭上おじゃまを修正してください。');
-}
-
-function readFileAsDataURL(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(reader.error || new Error('file read failed'));
-    reader.readAsDataURL(file);
-  });
 }
 
 function renderCandidates(id, result) {
@@ -368,8 +561,8 @@ function renderMessages(text) {
 async function askAma() {
   setStatus('ama評価中...');
   const body = {
-    p1: state.p1,
-    p2: state.p2,
+    p1: normalizePlayerForAma(state.p1),
+    p2: normalizePlayerForAma(state.p2),
     options: {
       width: Number(document.getElementById('beam-width').value) || 500,
       depth: Number(document.getElementById('beam-depth').value) || 24,
@@ -378,13 +571,9 @@ async function askAma() {
       weights: 'build',
     },
   };
-  const res = await fetch('/api/evaluate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-  if (!res.ok || data.error) {
+  const raw = await queryEvalWasm(body);
+  const data = prepareEvalResponse(raw);
+  if (data.error) {
     setStatus(data.error || '評価に失敗しました', true);
     return;
   }
@@ -402,6 +591,7 @@ function setup() {
   buildPalette();
   renderAll();
   document.getElementById('ask-btn').disabled = true;
+  initEvalWorker().catch(err => setStatus(err.message, true));
 
   const input = document.getElementById('image-input');
   input.addEventListener('change', () => {
