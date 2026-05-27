@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>スクショ評価</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>スクショ評価</h1>
+    <div class="actions">
+      <label class="file-button">
+        <input id="image-input" type="file" accept="image/*">
+        スクショを選択
+      </label>
+      <button id="analyze-btn" class="primary" disabled>解析</button>
+      <button id="ask-btn" disabled>Ask ama</button>
+    </div>
+    <div id="status" class="status"></div>
+  </header>
+
+  <main class="layout">
+    <section class="image-pane">
+      <img id="preview-image" alt="">
+    </section>
+
+    <section class="work-pane">
+      <div class="toolbar">
+        <div id="palette" class="palette"></div>
+        <div class="options">
+          <label>幅 <input id="beam-width" type="number" value="500" min="1"></label>
+          <label>深さ <input id="beam-depth" type="number" value="24" min="1"></label>
+          <label>秒 <input id="eval-timeout" type="number" value="60" min="1"></label>
+          <label><input id="no-fire" type="checkbox"> 発火除外</label>
+        </div>
+      </div>
+
+      <div class="players">
+        <section class="player" data-player="p1">
+          <h2>P1</h2>
+          <div class="meta">
+            <label>現在ツモ <span class="pair-editor" data-role="current"></span></label>
+            <label>NEXT1 <span class="pair-editor" data-role="next0"></span></label>
+            <label>NEXT2 <span class="pair-editor" data-role="next1"></span></label>
+            <label>頭上 <input class="garbage-input" type="number" min="0" value="0"></label>
+          </div>
+          <div class="board" data-player="p1"></div>
+        </section>
+
+        <section class="player" data-player="p2">
+          <h2>P2</h2>
+          <div class="meta">
+            <label>現在ツモ <span class="pair-editor" data-role="current"></span></label>
+            <label>NEXT1 <span class="pair-editor" data-role="next0"></span></label>
+            <label>NEXT2 <span class="pair-editor" data-role="next1"></span></label>
+            <label>頭上 <input class="garbage-input" type="number" min="0" value="0"></label>
+          </div>
+          <div class="board" data-player="p2"></div>
+        </section>
+      </div>
+    </section>
+
+    <aside class="result-pane">
+      <h2>評価</h2>
+      <div id="eval-summary" class="eval-summary muted">未評価</div>
+      <section>
+        <h3>P1戦略要素</h3>
+        <div id="p1-strategy" class="strategy-list muted">未評価</div>
+      </section>
+      <section>
+        <h3>P2戦略要素</h3>
+        <div id="p2-strategy" class="strategy-list muted">未評価</div>
+      </section>
+      <section>
+        <h3>P1候補</h3>
+        <ol id="p1-candidates" class="candidates"></ol>
+      </section>
+      <section>
+        <h3>P2候補</h3>
+        <ol id="p2-candidates" class="candidates"></ol>
+      </section>
+      <section>
+        <h3>メモ</h3>
+        <pre id="messages" class="messages"></pre>
+      </section>
+    </aside>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
