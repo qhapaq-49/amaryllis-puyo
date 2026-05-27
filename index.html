@@ -9,14 +9,16 @@
 </head>
 <body>
   <header class="topbar">
-    <h1>スクショ評価</h1>
+    <div class="title-block">
+      <h1>スクショ評価</h1>
+      <p class="credit">AI engine: <a href="https://github.com/citrus610/ama" target="_blank" rel="noopener">ama</a> by citrus610 · developer: <a href="https://x.com/Qhapaq_49" target="_blank" rel="noopener">@Qhapaq_49</a> · last updated: <span id="build-date">?</span></p>
+    </div>
     <div class="actions">
       <label class="file-button">
         <input id="image-input" type="file" accept="image/*">
         スクショを選択
       </label>
       <button id="analyze-btn" class="primary" disabled>解析</button>
-      <button id="ask-btn" disabled>Ask ama</button>
     </div>
     <div id="status" class="status"></div>
   </header>
@@ -88,6 +90,7 @@
     </aside>
   </main>
 
+  <script src="build-info.js"></script>
   <script src="screen-reader.js"></script>
   <script src="app.js"></script>
 </body>

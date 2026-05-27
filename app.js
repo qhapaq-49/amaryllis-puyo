@@ -6,6 +6,7 @@ const PLAYERS = ['p1', 'p2'];
 
 let selectedColor = 'R';
 let selectedFile = null;
+let previewUrl = null;
 let state = {
   p1: emptyPlayer(),
   p2: emptyPlayer(),
@@ -222,6 +223,7 @@ function emptyPlayer() {
   return {
     field: Array.from({ length: 13 }, () => '......'),
     current_piece: ['R', 'R'],
+    current_piece_detected: true,
     queue: [['R', 'R'], ['R', 'R']],
     garbage: 0,
   };
@@ -239,12 +241,15 @@ function cellClass(color) {
   return `color-${color}`;
 }
 
+function normalizeOptionalPair(pair) {
+  if (!Array.isArray(pair) || pair.length !== 2) return null;
+  const a = COLORS.includes(pair[0]) && pair[0] !== '.' && pair[0] !== '#' ? pair[0] : null;
+  const b = COLORS.includes(pair[1]) && pair[1] !== '.' && pair[1] !== '#' ? pair[1] : null;
+  return a && b ? [a, b] : null;
+}
+
 function normalizePair(pair) {
-  if (!Array.isArray(pair) || pair.length !== 2) return ['R', 'R'];
-  return [
-    COLORS.includes(pair[0]) && pair[0] !== '.' && pair[0] !== '#' ? pair[0] : 'R',
-    COLORS.includes(pair[1]) && pair[1] !== '.' && pair[1] !== '#' ? pair[1] : 'R',
-  ];
+  return normalizeOptionalPair(pair) || ['R', 'R'];
 }
 
 function normalizePlayer(player) {
@@ -255,9 +260,18 @@ function normalizePlayer(player) {
       return chars.map(c => COLORS.includes(c) ? c : '.').join('');
     });
   }
-  next.current_piece = player.current_piece ? normalizePair(player.current_piece) : ['R', 'R'];
   const queue = Array.isArray(player.queue) ? player.queue : [];
-  next.queue = [normalizePair(queue[0]), normalizePair(queue[1])];
+  const q0 = normalizeOptionalPair(queue[0]);
+  const q1 = normalizeOptionalPair(queue[1]);
+  next.queue = [q0 || ['R', 'R'], q1 || q0 || ['R', 'R']];
+  const current = normalizeOptionalPair(player.current_piece);
+  if (current) {
+    next.current_piece = current;
+    next.current_piece_detected = true;
+  } else {
+    next.current_piece = next.queue[0];
+    next.current_piece_detected = false;
+  }
   next.garbage = Math.max(0, Number(player.garbage) || 0);
   return next;
 }
@@ -291,6 +305,7 @@ function pairSelect(playerKey, role, index, value) {
   select.addEventListener('change', () => {
     if (role === 'current') {
       state[playerKey].current_piece[index] = select.value;
+      state[playerKey].current_piece_detected = true;
     } else {
       const queueIndex = role === 'next0' ? 0 : 1;
       state[playerKey].queue[queueIndex][index] = select.value;
@@ -347,7 +362,7 @@ function renderAll() {
     renderPairEditors(playerKey);
     renderBoard(playerKey);
   }
-  document.getElementById('ask-btn').disabled = false;
+  document.getElementById('analyze-btn').disabled = false;
 }
 
 async function analyzeImage() {
@@ -356,17 +371,26 @@ async function analyzeImage() {
     setStatus('画像解析モジュールが読み込まれていません', true);
     return;
   }
-  setStatus('解析中...');
+  const analyzeBtn = document.getElementById('analyze-btn');
+  analyzeBtn.disabled = true;
+  setStatus('画像読み取り中...');
   const data = await window.analyzeScreenFile(selectedFile);
   if (data.error) {
-    setStatus(data.error || '解析に失敗しました', true);
+    setStatus(data.error || '画像読み取りに失敗しました', true);
+    analyzeBtn.disabled = false;
     return;
   }
   state.p1 = normalizePlayer(data.p1 || {});
   state.p2 = normalizePlayer(data.p2 || {});
   renderAll();
   renderMessages(JSON.stringify(data, null, 2));
-  setStatus('解析完了。必要なら盤面・ツモ・頭上おじゃまを修正してください。');
+  const missingCurrent = PLAYERS.filter(playerKey => !state[playerKey].current_piece_detected).map(playerKey => playerKey.toUpperCase());
+  analyzeBtn.disabled = false;
+  if (missingCurrent.length) {
+    setStatus(`画像読み取り完了。現在ツモ未検出: ${missingCurrent.join('/')} は仮入力です。目視で修正してから解析してください。`);
+  } else {
+    setStatus('画像読み取り完了。必要なら目視で盤面・ツモ・頭上おじゃまを修正してから解析してください。');
+  }
 }
 
 function renderCandidates(id, result) {
@@ -559,6 +583,8 @@ function renderMessages(text) {
 }
 
 async function askAma() {
+  const analyzeBtn = document.getElementById('analyze-btn');
+  analyzeBtn.disabled = true;
   setStatus('ama評価中...');
   const body = {
     p1: normalizePlayerForAma(state.p1),
@@ -569,12 +595,14 @@ async function askAma() {
       timeout_sec: Number(document.getElementById('eval-timeout').value) || 60,
       no_fire: document.getElementById('no-fire').checked,
       weights: 'build',
+      skip_dfs_build: true,
     },
   };
   const raw = await queryEvalWasm(body);
   const data = prepareEvalResponse(raw);
   if (data.error) {
     setStatus(data.error || '評価に失敗しました', true);
+    analyzeBtn.disabled = false;
     return;
   }
 
@@ -585,30 +613,39 @@ async function askAma() {
   renderEvalSummary(data);
   renderMessages(JSON.stringify(data, null, 2));
   setStatus('評価完了');
+  analyzeBtn.disabled = false;
 }
 
 function setup() {
+  const buildDate = document.getElementById('build-date');
+  if (buildDate) buildDate.textContent = window.BUILD_DATE || '?';
   buildPalette();
   renderAll();
-  document.getElementById('ask-btn').disabled = true;
   initEvalWorker().catch(err => setStatus(err.message, true));
 
   const input = document.getElementById('image-input');
+  input.addEventListener('click', () => {
+    input.value = '';
+  });
   input.addEventListener('change', () => {
     selectedFile = input.files?.[0] || null;
-    document.getElementById('analyze-btn').disabled = !selectedFile;
     if (selectedFile) {
       const img = document.getElementById('preview-image');
-      img.src = URL.createObjectURL(selectedFile);
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrl = URL.createObjectURL(selectedFile);
+      img.src = previewUrl;
       img.style.display = 'block';
-      setStatus(selectedFile.name);
+      analyzeImage().catch(err => {
+        document.getElementById('analyze-btn').disabled = false;
+        setStatus(err.message, true);
+      });
     }
   });
   document.getElementById('analyze-btn').addEventListener('click', () => {
-    analyzeImage().catch(err => setStatus(err.message, true));
-  });
-  document.getElementById('ask-btn').addEventListener('click', () => {
-    askAma().catch(err => setStatus(err.message, true));
+    askAma().catch(err => {
+      document.getElementById('analyze-btn').disabled = false;
+      setStatus(err.message, true);
+    });
   });
 }
 
