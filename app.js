@@ -18,45 +18,107 @@ let evalWorkerReadyPromise = null;
 let evalCallId = 0;
 const evalPending = new Map();
 
+function rejectPendingEvalCalls(error) {
+  for (const [id, callbacks] of evalPending.entries()) {
+    evalPending.delete(id);
+    if (callbacks.timer) clearTimeout(callbacks.timer);
+    callbacks.reject(error);
+  }
+}
+
+function resetEvalWorker(error) {
+  if (evalWorker) evalWorker.terminate();
+  evalWorker = null;
+  evalWorkerReady = false;
+  evalWorkerReadyPromise = null;
+  if (error) rejectPendingEvalCalls(error);
+}
+
+async function ensureCrossOriginIsolation() {
+  if (self.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined') {
+    sessionStorage.removeItem('amaAnalyzerIsolationReloads');
+    return;
+  }
+  if (!('serviceWorker' in navigator)) {
+    throw new Error('このブラウザではSharedArrayBufferに必要なService Workerが使えません');
+  }
+
+  const attempts = Number(sessionStorage.getItem('amaAnalyzerIsolationReloads') || 0);
+  if (attempts >= 2) {
+    throw new Error('SharedArrayBufferが有効になっていません。ページを強制再読み込みしてください。');
+  }
+
+  setStatus('ama初期化のためページを再読み込みします...');
+  sessionStorage.setItem('amaAnalyzerIsolationReloads', String(attempts + 1));
+  sessionStorage.removeItem('coiReloadedBySelf');
+
+  try {
+    const reg = await navigator.serviceWorker.register('coi-serviceworker.js');
+    await reg.update();
+  } finally {
+    location.reload();
+  }
+
+  await new Promise(() => {});
+}
+
 function initEvalWorker() {
   if (evalWorkerReadyPromise) return evalWorkerReadyPromise;
-  evalWorkerReadyPromise = new Promise((resolve, reject) => {
-    evalWorker = new Worker('eval-worker.js');
-    evalWorker.onmessage = e => {
-      if (e.data.type === 'ready') {
-        evalWorkerReady = true;
-        resolve();
-        return;
-      }
-      if (e.data.type === 'init_error') {
-        reject(new Error(e.data.message || 'WASM初期化に失敗しました'));
-        return;
-      }
-      const callbacks = evalPending.get(e.data.id);
-      if (!callbacks) return;
-      evalPending.delete(e.data.id);
-      if (e.data.error) callbacks.reject(new Error(e.data.error));
-      else {
-        try {
-          callbacks.resolve(JSON.parse(e.data.result));
-        } catch (err) {
-          callbacks.reject(err);
+  evalWorkerReadyPromise = (async () => {
+    await ensureCrossOriginIsolation();
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const fail = message => {
+        if (settled) return;
+        settled = true;
+        resetEvalWorker();
+        reject(new Error(message || 'WASM初期化に失敗しました'));
+      };
+      const initTimer = setTimeout(() => fail('ama初期化がタイムアウトしました。再読み込みしてください。'), 15000);
+      evalWorker = new Worker('eval-worker.js');
+      evalWorker.onmessage = e => {
+        if (e.data.type === 'ready') {
+          if (settled) return;
+          settled = true;
+          clearTimeout(initTimer);
+          evalWorkerReady = true;
+          resolve();
+          return;
         }
-      }
-    };
-    evalWorker.onerror = e => reject(new Error(e.message || 'WASM worker error'));
-  });
+        if (e.data.type === 'init_error') {
+          clearTimeout(initTimer);
+          fail(e.data.message || 'WASM初期化に失敗しました');
+          return;
+        }
+        const callbacks = evalPending.get(e.data.id);
+        if (!callbacks) return;
+        evalPending.delete(e.data.id);
+        if (callbacks.timer) clearTimeout(callbacks.timer);
+        if (e.data.error) callbacks.reject(new Error(e.data.error));
+        else {
+          try {
+            callbacks.resolve(JSON.parse(e.data.result));
+          } catch (err) {
+            callbacks.reject(err);
+          }
+        }
+      };
+      evalWorker.onerror = e => fail(e.message || 'WASM worker error');
+    });
+  })();
   return evalWorkerReadyPromise;
 }
 
-async function queryEvalWasm(payload) {
-  if (!evalWorkerReady) {
-    setStatus('ama初期化中...');
-    await initEvalWorker();
-  }
+async function queryEvalWasm(payload, timeoutMs = 70000) {
+  if (!evalWorkerReady) await initEvalWorker();
   return new Promise((resolve, reject) => {
     const id = evalCallId++;
-    evalPending.set(id, { resolve, reject });
+    const timer = setTimeout(() => {
+      evalPending.delete(id);
+      resetEvalWorker();
+      reject(new Error('ama評価がタイムアウトしました。幅/深さを下げるか、盤面・ツモを確認してください。'));
+    }, timeoutMs);
+    evalPending.set(id, { resolve, reject, timer });
     evalWorker.postMessage({ id, input: JSON.stringify(payload) });
   });
 }
@@ -585,20 +647,25 @@ function renderMessages(text) {
 async function askAma() {
   const analyzeBtn = document.getElementById('analyze-btn');
   analyzeBtn.disabled = true;
+  if (!evalWorkerReady) {
+    setStatus('ama初期化中...');
+    await initEvalWorker();
+  }
   setStatus('ama評価中...');
+  const timeoutSec = Number(document.getElementById('eval-timeout').value) || 60;
   const body = {
     p1: normalizePlayerForAma(state.p1),
     p2: normalizePlayerForAma(state.p2),
     options: {
       width: Number(document.getElementById('beam-width').value) || 500,
       depth: Number(document.getElementById('beam-depth').value) || 24,
-      timeout_sec: Number(document.getElementById('eval-timeout').value) || 60,
+      timeout_sec: timeoutSec,
       no_fire: document.getElementById('no-fire').checked,
       weights: 'build',
       skip_dfs_build: true,
     },
   };
-  const raw = await queryEvalWasm(body);
+  const raw = await queryEvalWasm(body, Math.max(10000, timeoutSec * 1000 + 5000));
   const data = prepareEvalResponse(raw);
   if (data.error) {
     setStatus(data.error || '評価に失敗しました', true);

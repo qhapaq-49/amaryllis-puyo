@@ -2,13 +2,22 @@
 
 var _pendingMessages = [];
 var _evaluateScreenshot = null;
+var _initDone = false;
+var _initTimer = setTimeout(function () {
+  if (!_initDone) self.postMessage({ type: 'init_error', message: 'WASM runtime initialization timed out' });
+}, 15000);
 
 var Module = {
   onRuntimeInitialized: function () {
+    _initDone = true;
+    clearTimeout(_initTimer);
     _evaluateScreenshot = Module.cwrap('evaluate_screenshot', 'string', ['string']);
     self.postMessage({ type: 'ready' });
     _pendingMessages.forEach(handleMessage);
     _pendingMessages = null;
+  },
+  onAbort: function (what) {
+    self.postMessage({ type: 'init_error', message: 'WASM aborted: ' + String(what) });
   }
 };
 
