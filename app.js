@@ -484,13 +484,6 @@ function placementText(placement) {
   return `x=${col} ${placement.r || ''}`.trim();
 }
 
-function attackSummary(summary) {
-  const count = Number(summary?.count || 0);
-  if (!summary?.best) return `${count}件`;
-  const attack = summary.best.attack || {};
-  return `${count}件 / ${placementText(summary.best.placement)} ${formatNumber(attack.send_total)}個 ${formatNumber(attack.chain_count)}連鎖`;
-}
-
 function actionArraySummary(actions) {
   if (!Array.isArray(actions) || actions.length === 0) return '0件';
   const first = actions[0] || {};
@@ -506,6 +499,36 @@ function buildSummary(section) {
     return `${count}件 / ${placementText(best.placement)} eval ${formatNumber(best.ama_eval)}`;
   }
   return `${count}件 / ${placementText(best.placement)} value ${formatNumber(best.value)} q ${formatNumber(best.q)}`;
+}
+
+function compactBuildSummary(section) {
+  const count = Number(section?.count || 0);
+  if (!section?.best) return `${count}件`;
+  const best = section.best;
+  const score = best.ama_eval !== undefined ? best.ama_eval : best.value;
+  return `${count}件 / ${placementText(best.placement)} ${formatNumber(score)}`;
+}
+
+function summarizeBestAttack(summary) {
+  const data = summary?.candidates || summary;
+  const count = Number(data?.count || 0);
+  if (!data?.best) return `${count}件`;
+  const attack = data.best.attack || {};
+  return `${count}件 / ${formatNumber(attack.send_total)}個 / ${placementText(data.best.placement)}`;
+}
+
+function buildModeText(type) {
+  const labels = {
+    BUILD: 'BUILD 長期の形重視',
+    FREESTYLE: 'FREESTYLE 自由度重視',
+    FAST: 'FAST 短期・速度重視',
+    AC: 'AC 全消し/受け重視',
+  };
+  return labels[type] || type || '-';
+}
+
+function yesNo(value) {
+  return value ? 'yes' : 'no';
 }
 
 function hasAmaMove(summary) {
@@ -533,6 +556,95 @@ function inferDecision(side) {
   if (hasAmaMove(offense.harass?.crush)) return '潰し';
   if (hasAmaMove(offense.harass?.combo)) return '二段催促';
   return '積む';
+}
+
+function decisionExplanation(side, decision) {
+  const strategy = side?.strategy || {};
+  const incoming = strategy.incoming || {};
+  const offense = strategy.offense || {};
+  const pending = side?.pending || {};
+  const battle = side?.battle || {};
+  const enemyRead = side?.enemy_read || {};
+  const incomingCount = Number(pending.incoming || 0);
+  const acceptLimit = Number(incoming.accept_limit ?? side?.defense?.accept_limit ?? 0);
+  const margin = Number(battle.survival_margin || 0);
+  const maxResponse = Number(battle.max_response_send || 0);
+  const attackMax = Number(offense.attack_max_send_total || 0);
+
+  switch (decision) {
+  case '全消し返し':
+    return `相手の序盤全消し連鎖に対して、間に合う全消し返し候補があります。最良候補は${summarizeBestAttack(incoming.all_clear_return)}です。`;
+  case '即主砲で相殺':
+    return `頭上${formatNumber(incomingCount)}個に対し、即主砲候補が相殺条件を満たしています。最良候補は${summarizeBestAttack(incoming.immediate_main_return?.candidates)}です。`;
+  case 'クロス/同期返し':
+    return `相手発火に速度を合わせられる返しがあります。量と着弾の速さを優先し、${summarizeBestAttack(incoming.syncro_return)}を選びます。`;
+  case '受けて積む':
+    return `頭上${formatNumber(incomingCount)}個は受け許容量${formatNumber(acceptLimit)}個の範囲内です。撃たずに${buildModeText(incoming.accept_build_type)}で積みます。`;
+  case '小連鎖で返す':
+    return `受けだけでは足りないため、盤面を残しやすい小返しを優先します。最良候補は${summarizeBestAttack(incoming.small_return)}です。`;
+  case '主砲返し':
+    return `小返しや受けでは不足するため、主砲返しを選びます。候補は${summarizeBestAttack(incoming.main_return)}です。`;
+  case '最大火力で粘る':
+    return `十分な返しはありませんが、即死を避けるため最大火力に近い返しを選びます。候補は${summarizeBestAttack(incoming.desperate_return)}です。`;
+  case '敵発火への速攻':
+    return `相手の連鎖中に間に合う速い攻撃があります。相手3列目の空きを見て、${summarizeBestAttack(offense.counter_attack_during_enemy_chain)}を合わせます。`;
+  case 'キル狙い':
+    return `相手盤面がおじゃまで埋まり気味です。必要${formatNumber(offense.kill?.attack_need)}個に対し、キル候補${summarizeBestAttack(offense.kill?.candidates)}があります。`;
+  case '潰し':
+    return `自分の最大火力は${formatNumber(attackMax)}個でまだ発火優先ではありません。相手防御を超える潰し候補${summarizeBestAttack(offense.harass?.crush)}を選びます。`;
+  case '二段催促':
+    return `小さな催促後に大きな追撃が残る二段候補があります。候補は${summarizeBestAttack(offense.harass?.combo)}です。`;
+  case '防御判断':
+    return `頭上${formatNumber(incomingCount)}個に対し、生存余力は${formatNumber(margin)}個です。返し候補と積み候補の中から防御寄りに選んでいます。`;
+  default:
+    if (enemyRead.garbage_obstruct) {
+      return `相手盤面はおじゃまに埋まり気味ですが、即キル候補は不足しています。${buildModeText(offense.neutral_build_type)}で次の攻めを作ります。`;
+    }
+    return `即時の返し・キル・潰しより、将来火力を伸ばす価値が高い局面です。最大返し${formatNumber(maxResponse)}個を見つつ積みを継続します。`;
+  }
+}
+
+function decisionProcessRows(side, decision) {
+  const strategy = side.strategy || {};
+  const pending = side.pending || {};
+  const enemyRead = side.enemy_read || {};
+  const gaze = enemyRead.gaze || {};
+  const incoming = strategy.incoming || {};
+  const offense = strategy.offense || {};
+  const build = strategy.build_quality || {};
+  const battle = side.battle || {};
+
+  return [
+    {
+      label: 'おじゃま',
+      value: `頭上 ${formatNumber(pending.incoming)} / 送信 ${formatNumber(pending.outgoing)} / 余力 ${formatNumber(battle.survival_margin)}個`,
+      note: `受け許容量 ${formatNumber(incoming.accept_limit ?? side.defense?.accept_limit)}個、最大返し ${formatNumber(battle.max_response_send)}個`,
+      important: battle.status === 'critical' || battle.status === 'counter_required',
+    },
+    {
+      label: '相手読み',
+      value: `主砲 ${formatNumber(gaze.main?.send_total)}個 / 催促 ${formatNumber(gaze.harass?.send_total)}個 / 速攻 ${formatNumber(gaze.early?.send_total)}個`,
+      note: `小盤面 ${yesNo(enemyRead.small_field)}、おじゃま埋まり ${yesNo(enemyRead.garbage_obstruct)}、読み遅延 ${formatNumber(enemyRead.delay)}`,
+    },
+    {
+      label: '返し候補',
+      value: `即主砲 ${summarizeBestAttack(incoming.immediate_main_return?.candidates)} / 小返し ${summarizeBestAttack(incoming.small_return)}`,
+      note: `同期 ${summarizeBestAttack(incoming.syncro_return)} / 主砲返し ${summarizeBestAttack(incoming.main_return)} / 粘り ${summarizeBestAttack(incoming.desperate_return)}`,
+      important: ['即主砲で相殺', 'クロス/同期返し', '小連鎖で返す', '主砲返し', '最大火力で粘る'].includes(decision),
+    },
+    {
+      label: '攻め候補',
+      value: `最大火力 ${formatNumber(offense.attack_max_send_total)}個 / キル必要 ${formatNumber(offense.kill?.attack_need)}`,
+      note: `キル ${summarizeBestAttack(offense.kill?.candidates)} / 潰し ${summarizeBestAttack(offense.harass?.crush)} / 二段 ${summarizeBestAttack(offense.harass?.combo)}`,
+      important: ['敵発火への速攻', 'キル狙い', '潰し', '二段催促'].includes(decision),
+    },
+    {
+      label: '積み',
+      value: `beam ${compactBuildSummary(build.beam_build)} / 通常 ${buildModeText(offense.neutral_build_type)}`,
+      note: `防御時 ${buildModeText(incoming.fallback_build_type)}。FAST/FREESTYLE/ACは必要時にama内部で評価します`,
+      important: decision === '積む' || decision === '受けて積む',
+    },
+  ];
 }
 
 function statusText(status) {
@@ -581,13 +693,33 @@ function addStrategyHeading(container, label) {
   container.appendChild(heading);
 }
 
-function addStrategyRow(container, label, value, important = false) {
+function addDecisionCard(container, title, body) {
+  const card = document.createElement('div');
+  card.className = 'decision-card';
+  const h = document.createElement('div');
+  h.className = 'decision-title';
+  h.textContent = title;
+  const p = document.createElement('p');
+  p.textContent = body;
+  card.append(h, p);
+  container.appendChild(card);
+}
+
+function addStrategyRow(container, label, value, important = false, note = '') {
   const row = document.createElement('div');
   row.className = `strategy-row ${important ? 'important' : ''}`;
   const key = document.createElement('span');
   key.textContent = label;
-  const val = document.createElement('strong');
-  val.textContent = String(value);
+  const val = document.createElement('div');
+  val.className = 'strategy-value';
+  const main = document.createElement('strong');
+  main.textContent = String(value);
+  val.appendChild(main);
+  if (note) {
+    const detail = document.createElement('small');
+    detail.textContent = String(note);
+    val.appendChild(detail);
+  }
   row.append(key, val);
   container.appendChild(row);
 }
@@ -603,41 +735,41 @@ function renderStrategy(id, side) {
   el.classList.remove('muted');
 
   const strategy = side.strategy || {};
-  const pending = side.pending || {};
-  const enemyRead = side.enemy_read || {};
-  const gaze = enemyRead.gaze || {};
-  const incoming = strategy.incoming || {};
   const offense = strategy.offense || {};
   const build = strategy.build_quality || {};
   const move = side.ama_move || {};
-  const battle = side.battle || {};
   const decision = inferDecision(side);
+  const explanation = decisionExplanation(side, decision);
 
-  addStrategyHeading(el, '総合');
-  addStrategyRow(el, '生存余力', `${formatNumber(battle.survival_margin)}個 / 状態 ${statusText(battle.status)}`, battle.status === 'critical');
-  addStrategyRow(el, 'おじゃま差', `受け ${formatNumber(pending.incoming)} / 送り ${formatNumber(pending.outgoing)} / balance ${formatNumber(pending.balance)}`);
+  addDecisionCard(el, `${decision} / ${placementText(move.placement)} / eval ${formatNumber(move.eval)}`, explanation);
 
-  addStrategyHeading(el, '自分火力');
-  addStrategyRow(el, '最大火力', `${formatNumber(offense.attack_max_send_total)}個 / score ${formatNumber(offense.attack_max_score_total)}`);
-  addStrategyRow(el, '発火候補', actionArraySummary(side.self_attack_candidates));
-  addStrategyRow(el, '積み評価', `beam ${buildSummary(build.beam_build)} / freestyle ${buildSummary(build.freestyle_build)}`);
+  addStrategyHeading(el, '判断過程');
+  for (const row of decisionProcessRows(side, decision)) {
+    addStrategyRow(el, row.label, row.value, row.important, row.note);
+  }
 
-  addStrategyHeading(el, '相手火力');
-  addStrategyRow(el, '敵読み', `主砲 ${formatNumber(gaze.main?.send_total)}個 / 催促 ${formatNumber(gaze.harass?.send_total)}個 / 速攻 ${formatNumber(gaze.early?.send_total)}個`);
-  addStrategyRow(el, '敵防御', `1手 ${formatNumber(offense.enemy_defense_1_send)}個 / 2手 ${formatNumber(offense.enemy_defense_2_send)}個`);
-  addStrategyRow(el, '敵候補', actionArraySummary(side.enemy_attack_candidates));
-
-  addStrategyHeading(el, '戦略判断');
-  addStrategyRow(el, 'ama判断', `${decision} / ${placementText(move.placement)} eval ${formatNumber(move.eval)}`, true);
-  addStrategyRow(el, '受け許容量', `${formatNumber(incoming.accept_limit)}個 / 受け ${incoming.can_accept ? '可' : '不可'} / ${incoming.accept_build_type || '-'}`);
-  addStrategyRow(el, '返し候補', `即主砲 ${attackSummary(incoming.immediate_main_return?.candidates)} / 小返し ${attackSummary(incoming.small_return)} / 主砲返し ${attackSummary(incoming.main_return)}`);
-  addStrategyRow(el, 'キル判定', `${offense.kill?.checked ? '確認中' : '条件外'} / 必要 ${formatNumber(offense.kill?.attack_need)}個 / ${attackSummary(offense.kill?.candidates)}`);
-  addStrategyRow(el, '催促候補', `潰し ${attackSummary(offense.harass?.crush)} / 二段 ${attackSummary(offense.harass?.combo)} / 迎撃 ${attackSummary(offense.counter_attack_during_enemy_chain)}`);
-
-  addStrategyHeading(el, '論拠');
-  addStrategyRow(el, '速攻根拠', `可否 ${offense.harass?.eligible ? 'yes' : 'no'} / 敵3列 ${formatNumber(offense.harass?.enemy_column_3_height)} / 潰し差 ${formatNumber(offense.harass?.crush_margin)}個`);
-  addStrategyRow(el, '敵状態', `小盤面 ${enemyRead.small_field ? 'yes' : 'no'} / おじゃま埋まり ${enemyRead.garbage_obstruct ? 'yes' : 'no'}`);
-  addStrategyRow(el, '盤面', `ぷよ ${formatNumber(side.field?.count)} / おじゃま ${formatNumber(side.field?.garbage_count)} / 露出 ${formatNumber(side.field?.unburied_count)}`);
+  addStrategyHeading(el, '詳細');
+  addStrategyRow(
+    el,
+    '自分火力',
+    `${formatNumber(offense.attack_max_send_total)}個 / score ${formatNumber(offense.attack_max_score_total)}`,
+    false,
+    `発火候補 ${actionArraySummary(side.self_attack_candidates)}`
+  );
+  addStrategyRow(
+    el,
+    '相手防御',
+    `1手 ${formatNumber(offense.enemy_defense_1_send)}個 / 2手 ${formatNumber(offense.enemy_defense_2_send)}個`,
+    false,
+    `敵候補 ${actionArraySummary(side.enemy_attack_candidates)}`
+  );
+  addStrategyRow(
+    el,
+    '盤面',
+    `ぷよ ${formatNumber(side.field?.count)} / おじゃま ${formatNumber(side.field?.garbage_count)} / 露出 ${formatNumber(side.field?.unburied_count)}`,
+    false,
+    `積み評価 ${buildSummary(build.beam_build)}`
+  );
 }
 
 function renderMessages(text) {

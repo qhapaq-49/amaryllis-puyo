@@ -322,13 +322,45 @@ select {
   background: #0f172a;
 }
 
+.decision-card {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid #facc15;
+  border-radius: 6px;
+  background: #111827;
+}
+
+.decision-title {
+  color: #fef3c7;
+  font-weight: 800;
+}
+
+.decision-card p {
+  margin: 0;
+  color: #e5e7eb;
+  line-height: 1.45;
+}
+
 .strategy-row span {
   color: #a7f3d0;
+}
+
+.strategy-value {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
 }
 
 .strategy-row strong {
   color: #e5e7eb;
   font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.strategy-row small {
+  color: #9ca3af;
+  line-height: 1.35;
   overflow-wrap: anywhere;
 }
 
