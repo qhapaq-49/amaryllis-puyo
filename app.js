@@ -4,6 +4,77 @@ const COLORS = ['.', 'R', 'Y', 'G', 'B', 'P', '#'];
 const COLOR_LABELS = { '.': '空', R: 'R', Y: 'Y', G: 'G', B: 'B', P: 'P', '#': '×' };
 const PLAYERS = ['p1', 'p2'];
 
+const TERM_DEFINITIONS = [
+  {
+    term: '読めた最大連鎖',
+    body: '相手読みの最大値。現在ツモ+NEXT1までを実際に置く探索と、その後の発火点検出を含む最大スコアです。1手限定ではありません。',
+  },
+  {
+    term: '潜在最大連鎖',
+    body: '今の盤面からキーぷよを仮に足して見た将来火力です。実際のツモ順は保証しない、盤面ポテンシャル寄りの値です。',
+  },
+  {
+    term: '短連鎖候補',
+    body: '3連鎖以下で、盤面の崩れが大きすぎない攻撃候補です。一般的には催促・小連鎖に近い候補です。',
+  },
+  {
+    term: '即発火返し',
+    body: '相手の着弾猶予内に発火でき、頭上おじゃまを相殺できる返しです。現在ツモ1手だけとは限りません。',
+  },
+  {
+    term: '敵発火への速攻',
+    body: '相手が連鎖中で、こちらの速い攻撃が相手の着地前後に間に合う時の攻撃候補です。自分が防御側とは限りません。',
+  },
+  {
+    term: '同期返し',
+    body: '相手の連鎖にタイミングを合わせ、相手の攻撃量を上回る速い返しです。量だけでなく着弾の近さも見ます。',
+  },
+  {
+    term: '小返し',
+    body: '頭上おじゃまを返しつつ、発火後の盤面を比較的残す返しです。相手の次の短連鎖も加味します。',
+  },
+  {
+    term: '大連鎖返し',
+    body: '小返しでは足りない時に使う大きめの返しです。発火後の残り盤面が少ない候補がここに入ります。',
+  },
+  {
+    term: 'キル必要',
+    body: '相手の読めた最大連鎖と盤面の最低列から、埋め切るのに必要そうなおじゃま数を見積もった値です。',
+  },
+  {
+    term: '潰し',
+    body: '短めの攻撃で相手の防御候補を上回る手です。自分の盤面を残せるか、形を壊しすぎないかも見ます。',
+  },
+  {
+    term: '二段催促',
+    body: '小さな催促を打った後に大きな追撃が残る候補です。催促量と追撃量の両方を条件にします。',
+  },
+  {
+    term: '頭上/送信',
+    body: '頭上はそのプレイヤーに降る予定のおじゃま、送信は相手に送っている予定のおじゃまです。画面上の頭上おじゃまから差し引いて見ます。',
+  },
+  {
+    term: '受け許容量',
+    body: '今の盤面で受けても致命傷になりにくいおじゃま数の目安です。3列目の高さ、盤面のぷよ数、おじゃま数から決めます。',
+  },
+  {
+    term: '防御1手/防御2手',
+    body: '相手が短い猶予で返せる防御火力です。1手はかなり即時、2手は少し猶予ありで、盤面を一定以上残す候補だけを見ます。',
+  },
+  {
+    term: '生存余力',
+    body: '受け許容量+最大返し-頭上おじゃまの概算です。勝率ではなく、当面しのげるかを見る診断値です。',
+  },
+  {
+    term: '積み評価',
+    body: '入力されているツモ列でamaのBUILD評価をした値です。将来火力、形、連結、無駄消し、14段目の浪費などを見ます。',
+  },
+  {
+    term: '積みモード',
+    body: 'BUILDは通常の長期形重視、FASTは短期対応重視、FREESTYLEは形制約を緩めた積み、ACは全消しや受け寄りの積みです。',
+  },
+];
+
 let selectedColor = 'R';
 let selectedFile = null;
 let previewUrl = null;
@@ -542,10 +613,10 @@ function inferDecision(side) {
 
   if (incoming.active) {
     if (hasAmaMove(incoming.all_clear_return)) return '全消し返し';
-    if (hasAmaMove(incoming.immediate_main_return)) return '即主砲で相殺';
+    if (hasAmaMove(incoming.immediate_main_return)) return '即発火で相殺';
     if (hasAmaMove(incoming.syncro_return)) return 'クロス/同期返し';
     if (hasAmaMove(incoming.small_return)) return '小連鎖で返す';
-    if (hasAmaMove(incoming.main_return)) return '主砲返し';
+    if (hasAmaMove(incoming.main_return)) return '大連鎖返し';
     if (hasAmaMove(incoming.desperate_return)) return '最大火力で粘る';
     if (incoming.can_accept) return '受けて積む';
     return '防御判断';
@@ -574,16 +645,16 @@ function decisionExplanation(side, decision) {
   switch (decision) {
   case '全消し返し':
     return `相手の序盤全消し連鎖に対して、間に合う全消し返し候補があります。最良候補は${summarizeBestAttack(incoming.all_clear_return)}です。`;
-  case '即主砲で相殺':
-    return `頭上${formatNumber(incomingCount)}個に対し、即主砲候補が相殺条件を満たしています。最良候補は${summarizeBestAttack(incoming.immediate_main_return?.candidates)}です。`;
+  case '即発火で相殺':
+    return `頭上${formatNumber(incomingCount)}個に対し、即発火候補が相殺条件を満たしています。最良候補は${summarizeBestAttack(incoming.immediate_main_return?.candidates)}です。`;
   case 'クロス/同期返し':
     return `相手発火に速度を合わせられる返しがあります。量と着弾の速さを優先し、${summarizeBestAttack(incoming.syncro_return)}を選びます。`;
   case '受けて積む':
     return `頭上${formatNumber(incomingCount)}個は受け許容量${formatNumber(acceptLimit)}個の範囲内です。撃たずに${buildModeText(incoming.accept_build_type)}で積みます。`;
   case '小連鎖で返す':
     return `受けだけでは足りないため、盤面を残しやすい小返しを優先します。最良候補は${summarizeBestAttack(incoming.small_return)}です。`;
-  case '主砲返し':
-    return `小返しや受けでは不足するため、主砲返しを選びます。候補は${summarizeBestAttack(incoming.main_return)}です。`;
+  case '大連鎖返し':
+    return `小返しや受けでは不足するため、大連鎖返しを選びます。候補は${summarizeBestAttack(incoming.main_return)}です。`;
   case '最大火力で粘る':
     return `十分な返しはありませんが、即死を避けるため最大火力に近い返しを選びます。候補は${summarizeBestAttack(incoming.desperate_return)}です。`;
   case '敵発火への速攻':
@@ -623,14 +694,14 @@ function decisionProcessRows(side, decision) {
     },
     {
       label: '相手読み',
-      value: `主砲 ${formatNumber(gaze.main?.send_total)}個 / 催促 ${formatNumber(gaze.harass?.send_total)}個 / 速攻 ${formatNumber(gaze.early?.send_total)}個`,
-      note: `小盤面 ${yesNo(enemyRead.small_field)}、おじゃま埋まり ${yesNo(enemyRead.garbage_obstruct)}、読み遅延 ${formatNumber(enemyRead.delay)}`,
+      value: `読めた最大 ${formatNumber(gaze.main?.send_total)}個 / 短連鎖 ${formatNumber(gaze.harass?.send_total)}個 / 防御1手 ${formatNumber(gaze.defence_1?.send_total)}個`,
+      note: `潜在最大 ${formatNumber(gaze.main_q?.send_total)}個 / 防御2手 ${formatNumber(gaze.defence_2?.send_total)}個 / 小盤面 ${yesNo(enemyRead.small_field)} / おじゃま埋まり ${yesNo(enemyRead.garbage_obstruct)}`,
     },
     {
       label: '返し候補',
-      value: `即主砲 ${summarizeBestAttack(incoming.immediate_main_return?.candidates)} / 小返し ${summarizeBestAttack(incoming.small_return)}`,
-      note: `同期 ${summarizeBestAttack(incoming.syncro_return)} / 主砲返し ${summarizeBestAttack(incoming.main_return)} / 粘り ${summarizeBestAttack(incoming.desperate_return)}`,
-      important: ['即主砲で相殺', 'クロス/同期返し', '小連鎖で返す', '主砲返し', '最大火力で粘る'].includes(decision),
+      value: `即発火 ${summarizeBestAttack(incoming.immediate_main_return?.candidates)} / 小返し ${summarizeBestAttack(incoming.small_return)}`,
+      note: `同期 ${summarizeBestAttack(incoming.syncro_return)} / 大連鎖返し ${summarizeBestAttack(incoming.main_return)} / 粘り ${summarizeBestAttack(incoming.desperate_return)}`,
+      important: ['即発火で相殺', 'クロス/同期返し', '小連鎖で返す', '大連鎖返し', '最大火力で粘る'].includes(decision),
     },
     {
       label: '攻め候補',
@@ -754,7 +825,7 @@ function renderStrategy(id, side) {
     '自分火力',
     `${formatNumber(offense.attack_max_send_total)}個 / score ${formatNumber(offense.attack_max_score_total)}`,
     false,
-    `発火候補 ${actionArraySummary(side.self_attack_candidates)}`
+    `攻撃候補 ${actionArraySummary(side.self_attack_candidates)}`
   );
   addStrategyRow(
     el,
@@ -770,6 +841,19 @@ function renderStrategy(id, side) {
     false,
     `積み評価 ${buildSummary(build.beam_build)}`
   );
+}
+
+function renderTermDefinitions() {
+  const list = document.getElementById('term-definitions');
+  if (!list) return;
+  list.innerHTML = '';
+  for (const item of TERM_DEFINITIONS) {
+    const term = document.createElement('dt');
+    term.textContent = item.term;
+    const body = document.createElement('dd');
+    body.textContent = item.body;
+    list.append(term, body);
+  }
 }
 
 function renderMessages(text) {
@@ -818,6 +902,7 @@ async function askAma() {
 function setup() {
   const buildDate = document.getElementById('build-date');
   if (buildDate) buildDate.textContent = window.BUILD_DATE || '?';
+  renderTermDefinitions();
   buildPalette();
   renderAll();
   initEvalWorker().catch(err => setStatus(err.message, true));

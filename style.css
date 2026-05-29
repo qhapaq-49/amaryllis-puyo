@@ -278,6 +278,40 @@ select {
   font-weight: 700;
 }
 
+.terms {
+  margin-bottom: 14px;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  background: #0f172a;
+}
+
+.terms summary {
+  cursor: pointer;
+  padding: 9px 10px;
+  color: #f8fafc;
+  font-weight: 800;
+}
+
+.terms dl {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0 10px 10px;
+}
+
+.terms dt {
+  color: #a7f3d0;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.terms dd {
+  margin: 0 0 6px;
+  color: #d1d5db;
+  font-size: 0.76rem;
+  line-height: 1.4;
+}
+
 .muted {
   color: #9ca3af;
   font-weight: 500;
