@@ -606,7 +606,47 @@ function hasAmaMove(summary) {
   return Boolean(summary?.contains_ama_move || summary?.candidates?.contains_ama_move);
 }
 
+function decisionLabelFromStage(stage) {
+  const labels = {
+    'defense.all_clear_return': '全消し返し',
+    'defense.immediate_return': '即発火で相殺',
+    'defense.syncro_return': 'クロス/同期返し',
+    'defense.accept_build': '受けて積む',
+    'defense.small_return': '小連鎖で返す',
+    'defense.main_return': '大連鎖返し',
+    'defense.desperate_return': '最大火力で粘る',
+    'defense.fallback_build': '防御判断',
+    'offense.counter_during_enemy_chain': '敵発火への速攻',
+    'offense.kill': 'キル狙い',
+    'offense.harass_crush': '潰し',
+    'offense.harass_combo': '二段催促',
+    'neutral.build': '積む',
+  };
+  return labels[stage] || '';
+}
+
+function stageExplanation(stage) {
+  const explanations = {
+    'defense.all_clear_return': 'C++のai::thinkは、相手の序盤全消し連鎖に間に合う全消し返し分岐を通りました。',
+    'defense.immediate_return': 'C++のai::thinkは、頭上おじゃまを相殺できる即発火返し分岐を通りました。',
+    'defense.syncro_return': 'C++のai::thinkは、相手連鎖に速度を合わせる同期返し分岐を通りました。',
+    'defense.accept_build': 'C++のai::thinkは、頭上おじゃまを受けられると判断し、撃たずに積む分岐を通りました。',
+    'defense.small_return': 'C++のai::thinkは、盤面を残しやすい小返し分岐を通りました。',
+    'defense.main_return': 'C++のai::thinkは、小返しではなく大きめの返しを選ぶ分岐を通りました。',
+    'defense.desperate_return': 'C++のai::thinkは、十分な返しがない中で最大火力に近い返しを選ぶ分岐を通りました。',
+    'defense.fallback_build': 'C++のai::thinkは、防御側の返し候補を採用せず、防御用の積み分岐を通りました。',
+    'offense.counter_during_enemy_chain': 'C++のai::thinkは、相手連鎖中に間に合う速い攻撃を合わせる分岐を通りました。',
+    'offense.kill': 'C++のai::thinkは、相手盤面を埋め切れるキル候補を選ぶ分岐を通りました。',
+    'offense.harass_crush': 'C++のai::thinkは、相手防御を上回る潰し候補を選ぶ分岐を通りました。',
+    'offense.harass_combo': 'C++のai::thinkは、小催促から追撃を残す二段催促分岐を通りました。',
+    'neutral.build': 'C++のai::thinkは、即時攻撃や防御分岐を採用せず、通常の積み分岐を通りました。',
+  };
+  return explanations[stage] || '';
+}
+
 function inferDecision(side) {
+  const traced = decisionLabelFromStage(side?.ama_move?.decision_stage);
+  if (traced) return traced;
   const strategy = side?.strategy || {};
   const incoming = strategy.incoming || {};
   const offense = strategy.offense || {};
@@ -630,6 +670,8 @@ function inferDecision(side) {
 }
 
 function decisionExplanation(side, decision) {
+  const traced = stageExplanation(side?.ama_move?.decision_stage);
+  if (traced) return traced;
   const strategy = side?.strategy || {};
   const incoming = strategy.incoming || {};
   const offense = strategy.offense || {};
@@ -684,8 +726,19 @@ function decisionProcessRows(side, decision) {
   const offense = strategy.offense || {};
   const build = strategy.build_quality || {};
   const battle = side.battle || {};
+  const move = side.ama_move || {};
+  const stage = move.decision_stage || move.trace?.stage || '-';
+  const reason = move.decision_reason || move.trace?.reason || '-';
+  const buildStage = move.build_stage || move.trace?.build_stage || '-';
+  const buildReason = move.build_reason || move.trace?.build_reason || '-';
 
   return [
+    {
+      label: '分岐ログ',
+      value: `stage ${stage}`,
+      note: `reason ${reason} / build ${buildStage}: ${buildReason}`,
+      important: true,
+    },
     {
       label: 'おじゃま',
       value: `頭上 ${formatNumber(pending.incoming)} / 送信 ${formatNumber(pending.outgoing)} / 余力 ${formatNumber(battle.survival_margin)}個`,
