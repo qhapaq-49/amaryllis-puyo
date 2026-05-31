@@ -18,6 +18,12 @@
         <input id="image-input" type="file" accept="image/*">
         スクショを選択
       </label>
+      <label class="file-button">
+        <input id="video-input" type="file" accept="video/*">
+        動画を選択
+      </label>
+      <button id="video-scan-btn" disabled>動画解析</button>
+      <button id="video-cancel-btn" disabled>中止</button>
       <button id="analyze-btn" class="primary" disabled>解析</button>
     </div>
     <div id="status" class="status"></div>
@@ -26,6 +32,7 @@
   <main class="layout">
     <section class="image-pane">
       <img id="preview-image" alt="">
+      <video id="preview-video" controls playsinline preload="metadata"></video>
     </section>
 
     <section class="work-pane">
@@ -36,6 +43,10 @@
           <label>深さ <input id="beam-depth" type="number" value="24" min="1"></label>
           <label>秒 <input id="eval-timeout" type="number" value="60" min="1"></label>
           <label><input id="no-fire" type="checkbox"> 発火除外</label>
+          <label>動画間隔 <input id="video-step" type="number" value="0.75" min="0.25" max="5" step="0.25"></label>
+          <label>上限分 <input id="video-limit-min" type="number" value="10" min="1" max="120"></label>
+          <label>最大局面 <input id="video-max-states" type="number" value="80" min="1" max="1000"></label>
+          <label>安定 <input id="video-stable-frames" type="number" value="2" min="1" max="5"></label>
         </div>
       </div>
 
@@ -67,6 +78,11 @@
     <aside class="result-pane">
       <h2>評価</h2>
       <div id="eval-summary" class="eval-summary muted">未評価</div>
+      <section class="video-trace">
+        <h3>動画局面列</h3>
+        <div id="video-state-summary" class="video-state-summary muted">未抽出</div>
+        <ol id="video-states" class="video-states"></ol>
+      </section>
       <details class="terms" open>
         <summary>用語定義</summary>
         <dl id="term-definitions"></dl>

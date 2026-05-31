@@ -77,7 +77,12 @@ const TERM_DEFINITIONS = [
 
 let selectedColor = 'R';
 let selectedFile = null;
+let selectedVideoFile = null;
 let previewUrl = null;
+let videoPreviewUrl = null;
+let videoStates = [];
+let activeVideoStateIndex = -1;
+let videoScanCancel = false;
 let state = {
   p1: emptyPlayer(),
   p2: emptyPlayer(),
@@ -195,30 +200,41 @@ async function queryEvalWasm(payload, timeoutMs = 70000) {
 }
 
 function activeColors(player) {
-  const colors = [];
-  function add(c) {
-    if (['R', 'Y', 'G', 'B', 'P'].includes(c) && !colors.includes(c)) colors.push(c);
-  }
+  const puyoColors = ['R', 'Y', 'G', 'B', 'P'];
+  const weights = new Map();
+  const order = [];
+  const add = (c, weight) => {
+    if (!puyoColors.includes(c)) return;
+    if (!weights.has(c)) order.push(c);
+    weights.set(c, (weights.get(c) || 0) + weight);
+  };
   for (const row of player.field || []) {
-    for (const c of String(row)) add(c);
+    for (const c of String(row)) add(c, 1);
   }
-  const pairs = [];
-  if (player.current_piece) pairs.push(player.current_piece);
-  pairs.push(...(player.queue || []));
-  for (const pair of pairs) {
-    if (!Array.isArray(pair)) continue;
-    add(pair[0]);
-    add(pair[1]);
+  if (player.current_piece) {
+    add(player.current_piece[0], 50);
+    add(player.current_piece[1], 50);
   }
-  return colors;
+  const queue = Array.isArray(player.queue) ? player.queue : [];
+  queue.forEach((pair, i) => {
+    if (!Array.isArray(pair)) return;
+    const weight = i === 0 ? 30 : 20;
+    add(pair[0], weight);
+    add(pair[1], weight);
+  });
+  const firstSeen = new Map(order.map((c, i) => [c, i]));
+  return order
+    .sort((a, b) => (weights.get(b) - weights.get(a)) || firstSeen.get(a) - firstSeen.get(b))
+    .slice(0, 4);
 }
 
 function normalizePlayerForAma(player) {
   const amaColors = ['R', 'Y', 'G', 'B'];
   const colors = activeColors(player);
-  if (colors.length > 4) throw new Error(`ama supports up to 4 colors: ${colors.join('')}`);
   const mapping = { '.': '.', '#': '#' };
   colors.forEach((c, i) => { mapping[c] = amaColors[i]; });
+  const fallbackColor = colors.length ? mapping[colors[0]] : amaColors[0];
+  const mapPairColor = c => mapping[c] && mapping[c] !== '.' && mapping[c] !== '#' ? mapping[c] : fallbackColor;
 
   const field = (player.field || []).map(row => String(row).slice(0, 6).padEnd(6, '.').split('').map(c => mapping[c] || '.').join(''));
   if (field.length !== 13) throw new Error('field must contain exactly 13 rows');
@@ -229,12 +245,10 @@ function normalizePlayerForAma(player) {
   pairs.push(...(player.queue || []));
   for (const pair of pairs) {
     if (!Array.isArray(pair) || pair.length !== 2) continue;
-    const a = mapping[pair[0]];
-    const b = mapping[pair[1]];
-    if (a && b && a !== '.' && b !== '.' && a !== '#' && b !== '#') queue.push([a, b]);
+    queue.push([mapPairColor(pair[0]), mapPairColor(pair[1])]);
   }
-  if (queue.length < 3) throw new Error('current piece plus NEXT1 and NEXT2 are required');
-  return { field, queue, garbage: Math.max(0, Number(player.garbage) || 0) };
+  while (queue.length < 3) queue.push([fallbackColor, fallbackColor]);
+  return { field, queue: queue.slice(0, 3), garbage: Math.max(0, Number(player.garbage) || 0) };
 }
 
 function actionSend(action) {
@@ -913,43 +927,369 @@ function renderMessages(text) {
   document.getElementById('messages').textContent = text || '';
 }
 
-async function askAma() {
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function clampNumber(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function waitForVideoMetadata(video) {
+  if (video.readyState >= 1 && Number.isFinite(video.duration)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      video.removeEventListener('loadedmetadata', onReady);
+      video.removeEventListener('error', onError);
+    };
+    const onReady = () => { cleanup(); resolve(); };
+    const onError = () => { cleanup(); reject(new Error('動画を読み込めませんでした')); };
+    video.addEventListener('loadedmetadata', onReady, { once: true });
+    video.addEventListener('error', onError, { once: true });
+  });
+}
+
+function seekVideo(video, time) {
+  const target = Math.max(0, Math.min(time, Number.isFinite(video.duration) ? video.duration : time));
+  if (Math.abs(video.currentTime - target) < 0.025 && video.readyState >= 2) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('動画シークがタイムアウトしました'));
+    }, 8000);
+    const cleanup = () => {
+      clearTimeout(timer);
+      video.removeEventListener('seeked', onSeeked);
+      video.removeEventListener('error', onError);
+    };
+    const onSeeked = () => { cleanup(); resolve(); };
+    const onError = () => { cleanup(); reject(new Error('動画シークに失敗しました')); };
+    video.addEventListener('seeked', onSeeked, { once: true });
+    video.addEventListener('error', onError, { once: true });
+    video.currentTime = target;
+  });
+}
+
+function formatTime(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const frac = Math.floor(((Number(seconds) || 0) - total) * 10);
+  const base = h > 0
+    ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    : `${m}:${String(s).padStart(2, '0')}`;
+  return `${base}.${Math.max(0, frac)}`;
+}
+
+function clonePlayers(players) {
+  return {
+    p1: normalizePlayer(players.p1 || {}),
+    p2: normalizePlayer(players.p2 || {}),
+  };
+}
+
+function readablePlayer(raw) {
+  return raw && !raw.error && Array.isArray(raw.field) && raw.field.length === 13 && Array.isArray(raw.queue);
+}
+
+function readableScreen(data) {
+  return readablePlayer(data?.p1) && readablePlayer(data?.p2);
+}
+
+function videoStateSignature(players) {
+  return JSON.stringify({
+    p1: {
+      field: players.p1.field,
+      current: players.p1.current_piece,
+      queue: players.p1.queue,
+      garbage: players.p1.garbage,
+    },
+    p2: {
+      field: players.p2.field,
+      current: players.p2.current_piece,
+      queue: players.p2.queue,
+      garbage: players.p2.garbage,
+    },
+  });
+}
+
+function estimateReadConfidence(raw, players) {
+  if (!readableScreen(raw)) return 0;
+  let score = 1;
+  for (const key of PLAYERS) {
+    if (!raw[key]?.current_piece) score -= 0.10;
+    const visible = players[key].field.join('').replace(/[.]/g, '').length;
+    if (visible < 8) score -= 0.10;
+    if (players[key].queue.length < 2) score -= 0.10;
+  }
+  return Math.max(0, Math.min(1, score));
+}
+
+function videoStateEvalLabel(entry) {
+  if (entry.status === 'error') return `error: ${entry.error || '評価失敗'}`;
+  if (entry.status === 'evaluating') return 'ama評価中';
+  if (entry.evalData?.battle_eval) return battleLeaderText(entry.evalData.battle_eval);
+  if (entry.status === 'done') return '評価完了';
+  return '評価待ち';
+}
+
+function compactVideoState(entry) {
+  return {
+    index: entry.index,
+    time: entry.time,
+    scanIndex: entry.scanIndex,
+    confidence: entry.confidence,
+    status: entry.status,
+    error: entry.error,
+    p1: entry.players?.p1,
+    p2: entry.players?.p2,
+    eval: entry.evalData ? {
+      battle_eval: entry.evalData.battle_eval,
+      p1_stage: entry.evalData.strategy?.p1?.ama_move?.decision_stage,
+      p2_stage: entry.evalData.strategy?.p2?.ama_move?.decision_stage,
+      p1_move: entry.evalData.strategy?.p1?.ama_move?.placement,
+      p2_move: entry.evalData.strategy?.p2?.ama_move?.placement,
+    } : null,
+  };
+}
+
+function renderVideoStates() {
+  const summary = document.getElementById('video-state-summary');
+  const list = document.getElementById('video-states');
+  if (!summary || !list) return;
+  list.innerHTML = '';
+  if (videoStates.length === 0) {
+    summary.textContent = '未抽出';
+    summary.classList.add('muted');
+    return;
+  }
+  const done = videoStates.filter(s => s.status === 'done').length;
+  const errors = videoStates.filter(s => s.status === 'error').length;
+  summary.textContent = `${videoStates.length}局面 / 評価済み ${done} / エラー ${errors}`;
+  summary.classList.remove('muted');
+  for (const entry of videoStates) {
+    const li = document.createElement('li');
+    li.className = `video-state ${entry.status || 'pending'} ${entry.index === activeVideoStateIndex ? 'active' : ''}`;
+    const body = document.createElement('div');
+    const title = document.createElement('strong');
+    title.textContent = `state ${entry.index}  ${formatTime(entry.time)}  ${videoStateEvalLabel(entry)}`;
+    const detail = document.createElement('small');
+    detail.textContent = `confidence ${Math.round(entry.confidence * 100)}% / scan ${entry.scanIndex}`;
+    body.append(title, detail);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = '表示';
+    btn.addEventListener('click', () => applyVideoState(entry.index));
+    li.append(body, btn);
+    list.appendChild(li);
+  }
+}
+
+function applyVideoState(index) {
+  const entry = videoStates[index];
+  if (!entry) return;
+  activeVideoStateIndex = index;
+  state = clonePlayers(entry.players);
+  renderAll();
+  if (entry.evalData && !entry.evalData.error) renderEvalResult(entry.evalData);
+  renderMessages(JSON.stringify({ state: entry, eval: entry.evalData || null }, null, 2));
+  const video = document.getElementById('preview-video');
+  if (video && Number.isFinite(entry.time) && Math.abs(video.currentTime - entry.time) > 0.05) {
+    video.currentTime = entry.time;
+  }
+  renderVideoStates();
+  setStatus(`state ${index} を表示中`);
+}
+
+async function evaluateVideoState(entry) {
+  entry.status = 'evaluating';
+  renderVideoStates();
+  try {
+    const data = await evaluatePlayers(entry.players, `state ${entry.index} ama評価中...`);
+    if (data.error) throw new Error(data.error);
+    entry.evalData = data;
+    entry.status = 'done';
+    if (entry.index === activeVideoStateIndex) renderEvalResult(data);
+  } catch (err) {
+    entry.status = 'error';
+    entry.error = err.message || String(err);
+  }
+  renderVideoStates();
+}
+
+async function scanVideoTrace() {
+  if (!selectedVideoFile) return;
+  if (typeof window.analyzeScreenImageData !== 'function') {
+    setStatus('画像解析モジュールが読み込まれていません', true);
+    return;
+  }
+  const video = document.getElementById('preview-video');
+  const scanBtn = document.getElementById('video-scan-btn');
+  const cancelBtn = document.getElementById('video-cancel-btn');
   const analyzeBtn = document.getElementById('analyze-btn');
+  videoScanCancel = false;
+  scanBtn.disabled = true;
+  cancelBtn.disabled = false;
   analyzeBtn.disabled = true;
+  videoStates = [];
+  activeVideoStateIndex = -1;
+  renderVideoStates();
+
+  const stats = { scanned: 0, unreadable: 0, unstable: 0, duplicates: 0 };
+  try {
+    await waitForVideoMetadata(video);
+    if (!evalWorkerReady) {
+      setStatus('ama初期化中...');
+      await initEvalWorker();
+    }
+    const step = clampNumber(document.getElementById('video-step').value, 0.25, 5, 0.75);
+    const limitMin = clampNumber(document.getElementById('video-limit-min').value, 1, 120, 10);
+    const maxStates = Math.floor(clampNumber(document.getElementById('video-max-states').value, 1, 1000, 80));
+    const stableFrames = Math.floor(clampNumber(document.getElementById('video-stable-frames').value, 1, 5, 2));
+    const start = Math.max(0, Math.min(video.currentTime || 0, video.duration || 0));
+    const end = Math.min(video.duration || start, start + limitMin * 60);
+    const scale = Math.min(1, 1280 / Math.max(1, video.videoWidth || 1280));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round((video.videoWidth || 1280) * scale));
+    canvas.height = Math.max(1, Math.round((video.videoHeight || 720) * scale));
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+    let lastSignature = '';
+    let acceptedSignature = '';
+    let repeat = 0;
+    let scanIndex = 0;
+
+    for (let t = start; t <= end && videoStates.length < maxStates; t += step) {
+      if (videoScanCancel) break;
+      setStatus(`動画走査中 ${formatTime(t)} / ${formatTime(end)}  state ${videoStates.length}`);
+      await seekVideo(video, t);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      stats.scanned++;
+      scanIndex++;
+
+      let raw;
+      try {
+        raw = window.analyzeScreenImageData(ctx.getImageData(0, 0, canvas.width, canvas.height));
+      } catch (err) {
+        stats.unreadable++;
+        lastSignature = '';
+        repeat = 0;
+        continue;
+      }
+      if (!readableScreen(raw)) {
+        stats.unreadable++;
+        lastSignature = '';
+        repeat = 0;
+        continue;
+      }
+
+      const players = clonePlayers(raw);
+      const signature = videoStateSignature(players);
+      if (signature === lastSignature) repeat++;
+      else {
+        lastSignature = signature;
+        repeat = 1;
+      }
+
+      if (repeat < stableFrames) {
+        stats.unstable++;
+        continue;
+      }
+      if (signature === acceptedSignature) {
+        stats.duplicates++;
+        continue;
+      }
+
+      const entry = {
+        index: videoStates.length,
+        time: t,
+        scanIndex,
+        confidence: estimateReadConfidence(raw, players),
+        players,
+        raw,
+        signature,
+        status: 'pending',
+      };
+      videoStates.push(entry);
+      acceptedSignature = signature;
+      renderVideoStates();
+      applyVideoState(entry.index);
+      analyzeBtn.disabled = true;
+      await evaluateVideoState(entry);
+      await delay(0);
+    }
+
+    const status = videoScanCancel ? '動画解析を中止しました' : '動画解析完了';
+    setStatus(`${status}: ${videoStates.length}局面 / 走査 ${stats.scanned} / 読取失敗 ${stats.unreadable} / 重複 ${stats.duplicates}`);
+    renderMessages(JSON.stringify({
+      source: selectedVideoFile.name,
+      stats,
+      states: videoStates.map(compactVideoState),
+    }, null, 2));
+  } finally {
+    scanBtn.disabled = !selectedVideoFile;
+    cancelBtn.disabled = true;
+    analyzeBtn.disabled = false;
+  }
+}
+
+function evaluationPayload(players) {
+  const timeoutSec = Number(document.getElementById('eval-timeout').value) || 60;
+  return {
+    timeoutSec,
+    body: {
+      p1: normalizePlayerForAma(players.p1),
+      p2: normalizePlayerForAma(players.p2),
+      options: {
+        width: Number(document.getElementById('beam-width').value) || 500,
+        depth: Number(document.getElementById('beam-depth').value) || 24,
+        timeout_sec: timeoutSec,
+        no_fire: document.getElementById('no-fire').checked,
+        weights: 'build',
+        skip_dfs_build: true,
+      },
+    },
+  };
+}
+
+async function evaluatePlayers(players, statusMessage = 'ama評価中...') {
   if (!evalWorkerReady) {
     setStatus('ama初期化中...');
     await initEvalWorker();
   }
-  setStatus('ama評価中...');
-  const timeoutSec = Number(document.getElementById('eval-timeout').value) || 60;
-  const body = {
-    p1: normalizePlayerForAma(state.p1),
-    p2: normalizePlayerForAma(state.p2),
-    options: {
-      width: Number(document.getElementById('beam-width').value) || 500,
-      depth: Number(document.getElementById('beam-depth').value) || 24,
-      timeout_sec: timeoutSec,
-      no_fire: document.getElementById('no-fire').checked,
-      weights: 'build',
-      skip_dfs_build: true,
-    },
-  };
+  setStatus(statusMessage);
+  const { body, timeoutSec } = evaluationPayload(players);
   const raw = await queryEvalWasm(body, Math.max(10000, timeoutSec * 1000 + 5000));
-  const data = prepareEvalResponse(raw);
-  if (data.error) {
-    setStatus(data.error || '評価に失敗しました', true);
-    analyzeBtn.disabled = false;
-    return;
-  }
+  return prepareEvalResponse(raw);
+}
 
+function renderEvalResult(data) {
   renderCandidates('p1-candidates', data.players?.p1);
   renderCandidates('p2-candidates', data.players?.p2);
   renderStrategy('p1-strategy', data.strategy?.p1);
   renderStrategy('p2-strategy', data.strategy?.p2);
   renderEvalSummary(data);
-  renderMessages(JSON.stringify(data, null, 2));
-  setStatus('評価完了');
-  analyzeBtn.disabled = false;
+}
+
+async function askAma() {
+  const analyzeBtn = document.getElementById('analyze-btn');
+  analyzeBtn.disabled = true;
+  try {
+    const data = await evaluatePlayers(state);
+    if (data.error) {
+      setStatus(data.error || '評価に失敗しました', true);
+      return;
+    }
+    renderEvalResult(data);
+    renderMessages(JSON.stringify(data, null, 2));
+    setStatus('評価完了');
+  } finally {
+    analyzeBtn.disabled = false;
+  }
 }
 
 function setup() {
@@ -958,16 +1298,26 @@ function setup() {
   renderTermDefinitions();
   buildPalette();
   renderAll();
+  renderVideoStates();
   initEvalWorker().catch(err => setStatus(err.message, true));
 
   const input = document.getElementById('image-input');
+  const videoInput = document.getElementById('video-input');
+  const img = document.getElementById('preview-image');
+  const video = document.getElementById('preview-video');
   input.addEventListener('click', () => {
     input.value = '';
   });
   input.addEventListener('change', () => {
     selectedFile = input.files?.[0] || null;
     if (selectedFile) {
-      const img = document.getElementById('preview-image');
+      selectedVideoFile = null;
+      document.getElementById('video-scan-btn').disabled = true;
+      if (videoPreviewUrl) URL.revokeObjectURL(videoPreviewUrl);
+      videoPreviewUrl = null;
+      video.pause();
+      video.removeAttribute('src');
+      video.style.display = 'none';
       if (previewUrl) URL.revokeObjectURL(previewUrl);
       previewUrl = URL.createObjectURL(selectedFile);
       img.src = previewUrl;
@@ -977,6 +1327,38 @@ function setup() {
         setStatus(err.message, true);
       });
     }
+  });
+  videoInput.addEventListener('click', () => {
+    videoInput.value = '';
+  });
+  videoInput.addEventListener('change', () => {
+    selectedVideoFile = videoInput.files?.[0] || null;
+    if (!selectedVideoFile) return;
+    selectedFile = null;
+    img.style.display = 'none';
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = null;
+    if (videoPreviewUrl) URL.revokeObjectURL(videoPreviewUrl);
+    videoPreviewUrl = URL.createObjectURL(selectedVideoFile);
+    video.src = videoPreviewUrl;
+    video.style.display = 'block';
+    videoStates = [];
+    activeVideoStateIndex = -1;
+    renderVideoStates();
+    document.getElementById('video-scan-btn').disabled = false;
+    setStatus(`${selectedVideoFile.name} を読み込みました`);
+  });
+  document.getElementById('video-scan-btn').addEventListener('click', () => {
+    scanVideoTrace().catch(err => {
+      document.getElementById('video-scan-btn').disabled = !selectedVideoFile;
+      document.getElementById('video-cancel-btn').disabled = true;
+      document.getElementById('analyze-btn').disabled = false;
+      setStatus(err.message, true);
+    });
+  });
+  document.getElementById('video-cancel-btn').addEventListener('click', () => {
+    videoScanCancel = true;
+    setStatus('動画解析を中止しています...');
   });
   document.getElementById('analyze-btn').addEventListener('click', () => {
     askAma().catch(err => {
