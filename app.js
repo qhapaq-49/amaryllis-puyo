@@ -80,9 +80,16 @@ let selectedFile = null;
 let selectedVideoFile = null;
 let previewUrl = null;
 let videoPreviewUrl = null;
+let captureStream = null;
+let videoSourceKind = 'none';
 let videoStates = [];
 let activeVideoStateIndex = -1;
 let videoScanCancel = false;
+let videoEvalQueue = [];
+let videoEvalQueueRunning = false;
+let videoTraceRunId = 0;
+let videoTraceStats = null;
+let videoTraceSource = '';
 let state = {
   p1: emptyPlayer(),
   p2: emptyPlayer(),
@@ -927,6 +934,53 @@ function renderMessages(text) {
   document.getElementById('messages').textContent = text || '';
 }
 
+function videoSourceReady() {
+  return (videoSourceKind === 'file' && !!selectedVideoFile) || (videoSourceKind === 'capture' && !!captureStream);
+}
+
+function videoSourceName() {
+  if (videoSourceKind === 'file') return selectedVideoFile?.name || '動画ファイル';
+  if (videoSourceKind === 'capture') return 'タブ共有';
+  return '未選択';
+}
+
+function setVideoScanEnabled() {
+  const btn = document.getElementById('video-scan-btn');
+  if (btn) btn.disabled = !videoSourceReady();
+}
+
+function resetVideoTrace() {
+  videoTraceRunId++;
+  videoEvalQueue = [];
+  videoStates = [];
+  activeVideoStateIndex = -1;
+  videoTraceStats = null;
+  videoTraceSource = '';
+  renderVideoStates();
+}
+
+function stopCaptureStream() {
+  if (!captureStream) return;
+  for (const track of captureStream.getTracks()) track.stop();
+  captureStream = null;
+}
+
+function clearVideoElement(video) {
+  if (!video) return;
+  video.pause();
+  video.removeAttribute('src');
+  video.srcObject = null;
+  video.load();
+  video.style.display = 'none';
+}
+
+function renderVideoTraceMessages() {
+  renderMessages(JSON.stringify({
+    source: videoTraceSource || videoSourceName(),
+    stats: videoTraceStats,
+    states: videoStates.map(compactVideoState),
+  }, null, 2));
+}
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -939,7 +993,7 @@ function clampNumber(value, min, max, fallback) {
 }
 
 function waitForVideoMetadata(video) {
-  if (video.readyState >= 1 && Number.isFinite(video.duration)) return Promise.resolve();
+  if (video.readyState >= 1 && (Number.isFinite(video.duration) || video.srcObject)) return Promise.resolve();
   return new Promise((resolve, reject) => {
     const cleanup = () => {
       video.removeEventListener('loadedmetadata', onReady);
@@ -1031,6 +1085,8 @@ function estimateReadConfidence(raw, players) {
 
 function videoStateEvalLabel(entry) {
   if (entry.status === 'error') return `error: ${entry.error || '評価失敗'}`;
+  if (entry.status === 'canceled') return '評価中止';
+  if (entry.status === 'queued') return 'ama評価待ち';
   if (entry.status === 'evaluating') return 'ama評価中';
   if (entry.evalData?.battle_eval) return battleLeaderText(entry.evalData.battle_eval);
   if (entry.status === 'done') return '評価完了';
@@ -1042,6 +1098,7 @@ function compactVideoState(entry) {
     index: entry.index,
     time: entry.time,
     scanIndex: entry.scanIndex,
+    source: entry.source,
     confidence: entry.confidence,
     status: entry.status,
     error: entry.error,
@@ -1069,7 +1126,8 @@ function renderVideoStates() {
   }
   const done = videoStates.filter(s => s.status === 'done').length;
   const errors = videoStates.filter(s => s.status === 'error').length;
-  summary.textContent = `${videoStates.length}局面 / 評価済み ${done} / エラー ${errors}`;
+  const waiting = videoStates.filter(s => ['queued', 'evaluating'].includes(s.status)).length;
+  summary.textContent = `${videoStates.length}局面 / 評価済み ${done} / 評価待ち ${waiting} / エラー ${errors}`;
   summary.classList.remove('muted');
   for (const entry of videoStates) {
     const li = document.createElement('li');
@@ -1078,7 +1136,7 @@ function renderVideoStates() {
     const title = document.createElement('strong');
     title.textContent = `state ${entry.index}  ${formatTime(entry.time)}  ${videoStateEvalLabel(entry)}`;
     const detail = document.createElement('small');
-    detail.textContent = `confidence ${Math.round(entry.confidence * 100)}% / scan ${entry.scanIndex}`;
+    detail.textContent = `${entry.source || videoSourceName()} / confidence ${Math.round(entry.confidence * 100)}% / scan ${entry.scanIndex}`;
     body.append(title, detail);
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -1098,40 +1156,104 @@ function applyVideoState(index) {
   if (entry.evalData && !entry.evalData.error) renderEvalResult(entry.evalData);
   renderMessages(JSON.stringify({ state: entry, eval: entry.evalData || null }, null, 2));
   const video = document.getElementById('preview-video');
-  if (video && Number.isFinite(entry.time) && Math.abs(video.currentTime - entry.time) > 0.05) {
+  if (videoSourceKind === 'file' && video && Number.isFinite(entry.time) && Math.abs(video.currentTime - entry.time) > 0.05) {
     video.currentTime = entry.time;
   }
   renderVideoStates();
   setStatus(`state ${index} を表示中`);
 }
 
-async function evaluateVideoState(entry) {
+async function evaluateVideoState(entry, runId = videoTraceRunId) {
   entry.status = 'evaluating';
   renderVideoStates();
   try {
     const data = await evaluatePlayers(entry.players, `state ${entry.index} ama評価中...`);
+    if (runId !== videoTraceRunId || !videoStates.includes(entry)) return;
     if (data.error) throw new Error(data.error);
     entry.evalData = data;
     entry.status = 'done';
     if (entry.index === activeVideoStateIndex) renderEvalResult(data);
   } catch (err) {
+    if (runId !== videoTraceRunId || !videoStates.includes(entry)) return;
     entry.status = 'error';
     entry.error = err.message || String(err);
   }
   renderVideoStates();
 }
 
+function enqueueVideoStateEvaluation(entry, runId) {
+  entry.status = 'queued';
+  videoEvalQueue.push(entry);
+  renderVideoStates();
+  runVideoEvaluationQueue(runId);
+}
+
+async function runVideoEvaluationQueue(runId) {
+  if (videoEvalQueueRunning) return;
+  videoEvalQueueRunning = true;
+  try {
+    while (videoEvalQueue.length > 0 && runId === videoTraceRunId) {
+      if (videoScanCancel) {
+        for (const entry of videoEvalQueue) entry.status = 'canceled';
+        videoEvalQueue = [];
+        renderVideoStates();
+        break;
+      }
+      const entry = videoEvalQueue.shift();
+      if (!videoStates.includes(entry)) continue;
+      await evaluateVideoState(entry, runId);
+      if (runId !== videoTraceRunId) break;
+      renderVideoTraceMessages();
+      await delay(0);
+    }
+  } finally {
+    videoEvalQueueRunning = false;
+    renderVideoStates();
+    if (videoEvalQueue.length > 0 && !videoScanCancel) runVideoEvaluationQueue(videoTraceRunId);
+  }
+}
+
+function videoScanConfig() {
+  return {
+    step: clampNumber(document.getElementById('video-step').value, 0.25, 5, 0.75),
+    limitMin: clampNumber(document.getElementById('video-limit-min').value, 1, 120, 10),
+    maxStates: Math.floor(clampNumber(document.getElementById('video-max-states').value, 1, 1000, 80)),
+    stableFrames: Math.floor(clampNumber(document.getElementById('video-stable-frames').value, 1, 5, 2)),
+  };
+}
+
+async function waitForFrameReady(video) {
+  for (let i = 0; i < 40; i++) {
+    if (video.readyState >= 2 && (video.videoWidth || 0) > 0 && (video.videoHeight || 0) > 0) return;
+    await delay(100);
+  }
+  throw new Error('動画フレームを取得できませんでした');
+}
+
+function readCurrentVideoFrame(video, canvas, ctx) {
+  if (canvas.width !== Math.max(1, Math.round((video.videoWidth || 1280) * canvas._scale))) {
+    canvas.width = Math.max(1, Math.round((video.videoWidth || 1280) * canvas._scale));
+    canvas.height = Math.max(1, Math.round((video.videoHeight || 720) * canvas._scale));
+  }
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  return window.analyzeScreenImageData(ctx.getImageData(0, 0, canvas.width, canvas.height));
+}
+
 async function scanVideoTrace() {
-  if (!selectedVideoFile) return;
+  if (!videoSourceReady()) return;
   if (typeof window.analyzeScreenImageData !== 'function') {
     setStatus('画像解析モジュールが読み込まれていません', true);
     return;
   }
+  const runId = ++videoTraceRunId;
+  const sourceKind = videoSourceKind;
+  const sourceName = videoSourceName();
   const video = document.getElementById('preview-video');
   const scanBtn = document.getElementById('video-scan-btn');
   const cancelBtn = document.getElementById('video-cancel-btn');
   const analyzeBtn = document.getElementById('analyze-btn');
   videoScanCancel = false;
+  videoEvalQueue = [];
   scanBtn.disabled = true;
   cancelBtn.disabled = false;
   analyzeBtn.disabled = true;
@@ -1139,21 +1261,24 @@ async function scanVideoTrace() {
   activeVideoStateIndex = -1;
   renderVideoStates();
 
-  const stats = { scanned: 0, unreadable: 0, unstable: 0, duplicates: 0 };
+  const stats = { scanned: 0, unreadable: 0, unstable: 0, duplicates: 0, queued: 0 };
+  videoTraceStats = stats;
+  videoTraceSource = sourceName;
   try {
     await waitForVideoMetadata(video);
+    if (sourceKind === 'capture') await video.play().catch(() => {});
+    await waitForFrameReady(video);
     if (!evalWorkerReady) {
       setStatus('ama初期化中...');
       await initEvalWorker();
     }
-    const step = clampNumber(document.getElementById('video-step').value, 0.25, 5, 0.75);
-    const limitMin = clampNumber(document.getElementById('video-limit-min').value, 1, 120, 10);
-    const maxStates = Math.floor(clampNumber(document.getElementById('video-max-states').value, 1, 1000, 80));
-    const stableFrames = Math.floor(clampNumber(document.getElementById('video-stable-frames').value, 1, 5, 2));
-    const start = Math.max(0, Math.min(video.currentTime || 0, video.duration || 0));
-    const end = Math.min(video.duration || start, start + limitMin * 60);
+    const { step, limitMin, maxStates, stableFrames } = videoScanConfig();
+    const limitSec = limitMin * 60;
+    const start = sourceKind === 'file' ? Math.max(0, Math.min(video.currentTime || 0, video.duration || 0)) : 0;
+    const end = sourceKind === 'file' ? Math.min(video.duration || start, start + limitSec) : limitSec;
     const scale = Math.min(1, 1280 / Math.max(1, video.videoWidth || 1280));
     const canvas = document.createElement('canvas');
+    canvas._scale = scale;
     canvas.width = Math.max(1, Math.round((video.videoWidth || 1280) * scale));
     canvas.height = Math.max(1, Math.round((video.videoHeight || 720) * scale));
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -1162,28 +1287,38 @@ async function scanVideoTrace() {
     let acceptedSignature = '';
     let repeat = 0;
     let scanIndex = 0;
+    const startedAt = performance.now();
 
-    for (let t = start; t <= end && videoStates.length < maxStates; t += step) {
-      if (videoScanCancel) break;
-      setStatus(`動画走査中 ${formatTime(t)} / ${formatTime(end)}  state ${videoStates.length}`);
-      await seekVideo(video, t);
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    while (!videoScanCancel && videoStates.length < maxStates) {
+      let frameTime;
+      if (sourceKind === 'file') {
+        frameTime = start + scanIndex * step;
+        if (frameTime > end) break;
+        setStatus(`動画走査中 ${formatTime(frameTime)} / ${formatTime(end)}  state ${videoStates.length}`);
+        await seekVideo(video, frameTime);
+      } else {
+        frameTime = (performance.now() - startedAt) / 1000;
+        if (frameTime > end) break;
+        setStatus(`タブ共有走査中 ${formatTime(frameTime)} / ${formatTime(end)}  state ${videoStates.length}`);
+      }
+
       stats.scanned++;
       scanIndex++;
-
       let raw;
       try {
-        raw = window.analyzeScreenImageData(ctx.getImageData(0, 0, canvas.width, canvas.height));
+        raw = readCurrentVideoFrame(video, canvas, ctx);
       } catch (err) {
         stats.unreadable++;
         lastSignature = '';
         repeat = 0;
+        if (sourceKind === 'capture') await delay(step * 1000);
         continue;
       }
       if (!readableScreen(raw)) {
         stats.unreadable++;
         lastSignature = '';
         repeat = 0;
+        if (sourceKind === 'capture') await delay(step * 1000);
         continue;
       }
 
@@ -1197,41 +1332,43 @@ async function scanVideoTrace() {
 
       if (repeat < stableFrames) {
         stats.unstable++;
+        if (sourceKind === 'capture') await delay(step * 1000);
         continue;
       }
       if (signature === acceptedSignature) {
         stats.duplicates++;
+        if (sourceKind === 'capture') await delay(step * 1000);
         continue;
       }
 
       const entry = {
         index: videoStates.length,
-        time: t,
+        time: frameTime,
         scanIndex,
+        source: sourceName,
         confidence: estimateReadConfidence(raw, players),
         players,
         raw,
         signature,
-        status: 'pending',
+        status: 'queued',
       };
       videoStates.push(entry);
+      stats.queued++;
       acceptedSignature = signature;
       renderVideoStates();
       applyVideoState(entry.index);
       analyzeBtn.disabled = true;
-      await evaluateVideoState(entry);
-      await delay(0);
+      enqueueVideoStateEvaluation(entry, runId);
+      renderVideoTraceMessages();
+      if (sourceKind === 'capture') await delay(step * 1000);
+      else await delay(0);
     }
 
-    const status = videoScanCancel ? '動画解析を中止しました' : '動画解析完了';
+    const status = videoScanCancel ? '動画解析を中止しました' : '動画局面抽出完了';
     setStatus(`${status}: ${videoStates.length}局面 / 走査 ${stats.scanned} / 読取失敗 ${stats.unreadable} / 重複 ${stats.duplicates}`);
-    renderMessages(JSON.stringify({
-      source: selectedVideoFile.name,
-      stats,
-      states: videoStates.map(compactVideoState),
-    }, null, 2));
+    renderVideoTraceMessages();
   } finally {
-    scanBtn.disabled = !selectedVideoFile;
+    scanBtn.disabled = !videoSourceReady();
     cancelBtn.disabled = true;
     analyzeBtn.disabled = false;
   }
@@ -1292,6 +1429,78 @@ async function askAma() {
   }
 }
 
+function openYouTubeUrl() {
+  const input = document.getElementById('youtube-url');
+  const raw = input?.value?.trim();
+  if (!raw) {
+    setStatus('YouTube URLを入力してください', true);
+    return;
+  }
+  let url;
+  try {
+    url = new URL(raw);
+  } catch (err) {
+    setStatus('URLの形式が不正です', true);
+    return;
+  }
+  const host = url.hostname.replace(/^www\./, '');
+  if (!['youtube.com', 'm.youtube.com', 'youtu.be'].includes(host)) {
+    setStatus('YouTubeのURLを入力してください', true);
+    return;
+  }
+  const opened = window.open(url.href, '_blank', 'noopener');
+  if (!opened) {
+    setStatus('ポップアップがブロックされました', true);
+    return;
+  }
+  setStatus('YouTubeを開きました。タブ共有でそのタブを選んでください。');
+}
+
+async function startCaptureSource() {
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    setStatus('このブラウザではタブ共有を使えません', true);
+    return;
+  }
+  const img = document.getElementById('preview-image');
+  const video = document.getElementById('preview-video');
+  const stream = await navigator.mediaDevices.getDisplayMedia({
+    video: {
+      frameRate: { ideal: 5, max: 10 },
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+    },
+    audio: false,
+  });
+  stopCaptureStream();
+  if (videoPreviewUrl) URL.revokeObjectURL(videoPreviewUrl);
+  videoPreviewUrl = null;
+  captureStream = stream;
+  videoSourceKind = 'capture';
+  selectedFile = null;
+  selectedVideoFile = null;
+  img.style.display = 'none';
+  if (previewUrl) URL.revokeObjectURL(previewUrl);
+  previewUrl = null;
+  resetVideoTrace();
+  video.srcObject = stream;
+  video.style.display = 'block';
+  video.muted = true;
+  await waitForVideoMetadata(video);
+  await video.play().catch(() => {});
+  for (const track of stream.getVideoTracks()) {
+    track.addEventListener('ended', () => {
+      if (captureStream === stream) {
+        captureStream = null;
+        if (videoSourceKind === 'capture') videoSourceKind = 'none';
+        setVideoScanEnabled();
+        setStatus('タブ共有が終了しました');
+      }
+    }, { once: true });
+  }
+  setVideoScanEnabled();
+  setStatus('タブ共有を開始しました');
+}
+
 function setup() {
   const buildDate = document.getElementById('build-date');
   if (buildDate) buildDate.textContent = window.BUILD_DATE || '?';
@@ -1311,13 +1520,14 @@ function setup() {
   input.addEventListener('change', () => {
     selectedFile = input.files?.[0] || null;
     if (selectedFile) {
+      stopCaptureStream();
+      videoSourceKind = 'none';
       selectedVideoFile = null;
-      document.getElementById('video-scan-btn').disabled = true;
+      setVideoScanEnabled();
       if (videoPreviewUrl) URL.revokeObjectURL(videoPreviewUrl);
       videoPreviewUrl = null;
-      video.pause();
-      video.removeAttribute('src');
-      video.style.display = 'none';
+      clearVideoElement(video);
+      resetVideoTrace();
       if (previewUrl) URL.revokeObjectURL(previewUrl);
       previewUrl = URL.createObjectURL(selectedFile);
       img.src = previewUrl;
@@ -1334,23 +1544,28 @@ function setup() {
   videoInput.addEventListener('change', () => {
     selectedVideoFile = videoInput.files?.[0] || null;
     if (!selectedVideoFile) return;
+    stopCaptureStream();
+    videoSourceKind = 'file';
     selectedFile = null;
     img.style.display = 'none';
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     previewUrl = null;
     if (videoPreviewUrl) URL.revokeObjectURL(videoPreviewUrl);
     videoPreviewUrl = URL.createObjectURL(selectedVideoFile);
+    clearVideoElement(video);
     video.src = videoPreviewUrl;
     video.style.display = 'block';
-    videoStates = [];
-    activeVideoStateIndex = -1;
-    renderVideoStates();
-    document.getElementById('video-scan-btn').disabled = false;
+    resetVideoTrace();
+    setVideoScanEnabled();
     setStatus(`${selectedVideoFile.name} を読み込みました`);
+  });
+  document.getElementById('open-youtube-btn').addEventListener('click', openYouTubeUrl);
+  document.getElementById('capture-source-btn').addEventListener('click', () => {
+    startCaptureSource().catch(err => setStatus(err.message, true));
   });
   document.getElementById('video-scan-btn').addEventListener('click', () => {
     scanVideoTrace().catch(err => {
-      document.getElementById('video-scan-btn').disabled = !selectedVideoFile;
+      setVideoScanEnabled();
       document.getElementById('video-cancel-btn').disabled = true;
       document.getElementById('analyze-btn').disabled = false;
       setStatus(err.message, true);
@@ -1358,6 +1573,9 @@ function setup() {
   });
   document.getElementById('video-cancel-btn').addEventListener('click', () => {
     videoScanCancel = true;
+    for (const entry of videoEvalQueue) entry.status = 'canceled';
+    videoEvalQueue = [];
+    renderVideoStates();
     setStatus('動画解析を中止しています...');
   });
   document.getElementById('analyze-btn').addEventListener('click', () => {

@@ -74,6 +74,11 @@ button.primary {
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
+}
+
+.url-input {
+  width: min(260px, 34vw);
 }
 
 .status {
@@ -387,6 +392,15 @@ select {
   color: #fecaca;
 }
 
+.video-state.queued strong,
+.video-state.evaluating strong {
+  color: #fde68a;
+}
+
+.video-state.canceled strong {
+  color: #cbd5e1;
+}
+
 .video-state button {
   padding: 5px 8px;
 }
@@ -504,5 +518,9 @@ select {
 
   .toolbar {
     flex-direction: column;
+  }
+
+  .url-input {
+    width: 100%;
   }
 }
